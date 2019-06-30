@@ -7,10 +7,15 @@
 // extern crate panic_itm; // logs messages over ITM; requires ITM support
 extern crate panic_semihosting; // logs messages to the host stderr; requires a debugger
 
-use cortex_m::peripheral::syst::SystClkSource;
-use cortex_m::Peripherals;
 use cortex_m_rt::entry;
 use cortex_m_semihosting::hprintln;
+
+use stm32f1xx_hal::{
+    prelude::*,
+    pac,
+    timer::Timer,
+};
+use nb::block;
 
 const MAXIMUM_TEMPERATURE: f32 = 60.0;
 const MINIMUM_MEASUREMENTS: usize = 10;
@@ -33,13 +38,6 @@ impl Grill {
     pub(crate) fn measure(&mut self) {
         let current_measure = Some(60.0);
         self.measures[self.current_slot()] = current_measure;
-        hprintln!(
-            "Current measure {} slot {} Measured {:?}",
-            self.position,
-            self.current_slot(),
-            current_measure
-        )
-        .unwrap();
         self.increment_position();
     }
 
@@ -88,18 +86,38 @@ impl Grill {
 
 #[entry]
 fn main() -> ! {
-    hprintln!("Starting").unwrap();
-    let mut measurements = Grill::new();
-    let peripherals = Peripherals::take().unwrap();
-    let mut timer = peripherals.SYST;
+    // Get access to the core peripherals from the cortex-m crate
+    let cp = cortex_m::Peripherals::take().unwrap();
+    // Get access to the device specific peripherals from the peripheral access crate
+    let dp = pac::Peripherals::take().unwrap();
 
-    timer.set_clock_source(SystClkSource::Core);
-    timer.set_reload(SECOND);
-    timer.enable_counter();
+    // Take ownership over the raw flash and rcc devices and convert them into the corresponding
+    // HAL structs
+    let mut flash = dp.FLASH.constrain();
+    let mut rcc = dp.RCC.constrain();
 
+    // Freeze the configuration of all the clocks in the system and store
+    // the frozen frequencies in `clocks`
+    let clocks = rcc.cfgr.freeze(&mut flash.acr);
+
+    // Acquire the GPIOC peripheral
+    let mut gpioc = dp.GPIOC.split(&mut rcc.apb2);
+
+    // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the function
+    // in order to configure the port. For pins 0-7, crl should be passed instead.
+    let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
+    // Configure the syst timer to trigger an update every second
+    let mut timer = Timer::syst(cp.SYST, 1.hz(), clocks);
+
+    let a = 0x40011000 as *const i32;
+
+    // Wait for the timer to trigger an update and change the state of the LED
     loop {
-        measurements.measure();
-        measurements.trigger_error();
-        while !timer.has_wrapped() {}
+        block!(timer.wait()).unwrap();
+        unsafe {hprintln!("High {:#b}", *a).unwrap();}
+        led.set_high();
+        block!(timer.wait()).unwrap();
+        unsafe {hprintln!("Low  {:#b}", *a).unwrap();}
+        led.set_low();
     }
 }
