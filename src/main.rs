@@ -1,88 +1,19 @@
 #![no_std]
 #![no_main]
 
-// pick a panicking behavior
-//extern crate panic_halt; // you can put a breakpoint on `rust_begin_unwind` to catch panics
-// extern crate panic_abort; // requires nightly
-// extern crate panic_itm; // logs messages over ITM; requires ITM support
-extern crate panic_semihosting; // logs messages to the host stderr; requires a debugger
+use core::{convert::Infallible, fmt::Error};
 
+use barbecue_burner::{exit, thermometer::Thermometer};
 use cortex_m_rt::entry;
-use cortex_m_semihosting::hprintln;
 
-use stm32f1xx_hal::{
-    prelude::*,
-    pac,
-    timer::Timer,
-};
 use nb::block;
+use stm32f1xx_hal::{delay::Delay, pac, prelude::*, time::Hertz, timer::Timer};
 
-const MAXIMUM_TEMPERATURE: f32 = 60.0;
-const MINIMUM_MEASUREMENTS: usize = 10;
-const MILLISECOND: u32 = 8_000;
-const SECOND: u32 = MILLISECOND * 1_000;
-
-struct Grill {
-    measures: [Option<f32>; MINIMUM_MEASUREMENTS],
-    position: usize,
-}
-
-impl Grill {
-    pub(crate) fn new() -> Self {
-        Self {
-            measures: [None; MINIMUM_MEASUREMENTS],
-            position: 0,
-        }
-    }
-
-    pub(crate) fn measure(&mut self) {
-        let current_measure = Some(60.0);
-        self.measures[self.current_slot()] = current_measure;
-        self.increment_position();
-    }
-
-    pub(crate) fn has_minimum_measurements(&self) -> bool {
-        self.measures.iter().all(|m| m.is_some())
-    }
-
-    pub(crate) fn current_average_temperature(&self) -> f32 {
-        let total: f32 = self.measures.iter().map(|m| m.unwrap()).sum();
-        total / MINIMUM_MEASUREMENTS as f32
-    }
-
-    pub(crate) fn grill_too_hot(&self) -> bool {
-        self.current_average_temperature() >= MAXIMUM_TEMPERATURE
-    }
-
-    pub(crate) fn someone_present(&self) -> bool {
-        false
-    }
-
-    pub(crate) fn should_trigger_error(&self) -> bool {
-        if self.has_minimum_measurements() {
-            self.grill_too_hot() && !self.someone_present()
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn trigger_error(&self) {
-        if self.should_trigger_error() {
-            hprintln!("Trigger").unwrap();
-        } else {
-            hprintln!("No trigger").unwrap();
-        }
-    }
-
-    fn increment_position(&mut self) -> usize {
-        self.position = self.position.wrapping_add(1);
-        self.position
-    }
-
-    fn current_slot(&self) -> usize {
-        self.position % MINIMUM_MEASUREMENTS
-    }
-}
+use defmt::info;
+use embedded_hal::blocking::delay::*;
+use embedded_hal::digital::v2::InputPin;
+use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::prelude::*;
 
 #[entry]
 fn main() -> ! {
@@ -98,26 +29,31 @@ fn main() -> ! {
 
     // Freeze the configuration of all the clocks in the system and store
     // the frozen frequencies in `clocks`
-    let clocks = rcc.cfgr.freeze(&mut flash.acr);
+    let clocks = rcc
+        .cfgr
+        .use_hse(16.mhz())
+        .sysclk(72.mhz())
+        .freeze(&mut flash.acr);
+    info!("HCLK: {:u32}", clocks.hclk().0);
 
-    // Acquire the GPIOC peripheral
-    let mut gpioc = dp.GPIOC.split(&mut rcc.apb2);
+    // Acquire the GPIO peripherals that we'll use
+    let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
+    let mut gpiob = dp.GPIOB.split(&mut rcc.apb2);
 
-    // Configure gpio C pin 13 as a push-pull output. The `crh` register is passed to the function
+    // Configure gpio B pin 12 as a push-pull output. The `crh` register is passed to the function
     // in order to configure the port. For pins 0-7, crl should be passed instead.
-    let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
-    // Configure the syst timer to trigger an update every second
-    let mut timer = Timer::syst(cp.SYST, 1.hz(), clocks);
+    let mut led = gpiob.pb12.into_push_pull_output(&mut gpiob.crh);
+    let mut delay = Delay::new(cp.SYST, clocks);
+    // 1.hz();
+    let mut a2 = gpioa.pa2.into_dynamic(&mut gpioa.crl);
+    // let a2 = gpioa.pa2.into_pull_up_input(&mut gpioa.crl);
 
-    let a = 0x40011000 as *const i32;
+    let mut thermometer = Thermometer::new(a2, gpioa.crl, delay);
 
-    // Wait for the timer to trigger an update and change the state of the LED
     loop {
-        block!(timer.wait()).unwrap();
-        unsafe {hprintln!("High {:#b}", *a).unwrap();}
-        led.set_high();
-        block!(timer.wait()).unwrap();
-        unsafe {hprintln!("Low  {:#b}", *a).unwrap();}
-        led.set_low();
+        let is_parasite_mode = thermometer.is_parasite_mode();
+        info!("Parasite mode? {:bool}", is_parasite_mode);
+        let rom = thermometer.read_rom();
+        let rom = exit();
     }
 }
